@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -29,92 +30,177 @@ func (r *record) CallBack(inputBuffer, outputBuffer unsafe.Pointer, frames uint6
 }
 
 type play struct {
-	q *locklessq.Qint16
+	*wavreader.Wav
+	q16 *locklessq.Qint16
+	q32 *locklessq.Qfloat32
+}
+
+func (p *play) Write(buff []byte) (int, error) {
+	if p.q16 != nil {
+		return p.write16(buff)
+	}
+	return p.write32(buff)
+}
+
+func (p *play) write16(buff []byte) (int, error) {
+	for i := 0; i < len(buff); i = i + 2 {
+		p.q16.Insert(conv.BytesToint16(buff, i))
+	}
+	return len(buff), nil
+}
+
+func (p *play) write32(buff []byte) (int, error) {
+	for i := 0; i < len(buff); i = i + 4 {
+		p.q32.Insert(conv.BytesToFloat32(buff, i))
+	}
+	return len(buff), nil
 }
 
 func (p *play) CallBack(inputBuffer, outputBuffer unsafe.Pointer, frames uint64) {
+	if p.q16 != nil {
+		p.cb16(inputBuffer, outputBuffer, frames)
+		return
+	}
+	p.cb32(inputBuffer, outputBuffer, frames)
+}
+
+func (p *play) cb16(inputBuffer, outputBuffer unsafe.Pointer, frames uint64) {
 	ob := (*[1024]int16)(outputBuffer)
 	for i := 0; i < len(ob); i++ {
-		val, _ := p.q.Pop()
+		val, _ := p.q16.Pop()
+		(*ob)[i] = val
+	}
+}
+
+func (p *play) cb32(inputBuffer, outputBuffer unsafe.Pointer, frames uint64) {
+	ob := (*[1024]float32)(outputBuffer)
+	for i := 0; i < len(ob); i++ {
+		val, _ := p.q32.Pop()
 		(*ob)[i] = val
 	}
 }
 
 func main() {
 
-	action := flag.String("action", "play", "play - plats the recorded buffer\nsave - saves the buffer as wav")
+	action := flag.String("action", "recnplay", "recnplay - records and plays\nrecnsave - records and saves the buffer as wav\nplay - plays a file")
 	file := flag.String("file", "/Users/elerer/samples/temp.wav", "path to save file as wav")
 	sec := flag.Uint64("sec", 4, "seconds to record")
+	uisf := flag.Uint64("sf", 8, "1 - 32 bit float\n8 - 16 bit")
+
+	var (
+		si        *record
+		player    *play
+		in        pa.PaStreamParameters
+		desiredSR uint64
+		sf        pa.SampleFormat
+		channels  = 1
+	)
 
 	flag.Parse()
 
-	err := pa.Initialize()
-	if err != nil {
-		println("ERROR ", err.Error())
-		return
-	}
-	defer pa.Terminate()
+	sf = pa.SampleFormat(*uisf)
 
-	pa.ListDevices()
+	if strings.Contains(*action, "rec") {
+		err := pa.Initialize()
+		if err != nil {
+			println("ERROR ", err.Error())
+			return
+		}
+		defer pa.Terminate()
 
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Select device num for record: ")
-	text, _ := reader.ReadString('\n')
-	devnum, err := strconv.Atoi(strings.TrimSuffix(text, "\n"))
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	println("selected  ", devnum)
-
-	in := pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: 1, Sampleformat: pa.Int16}
-	desiredSR := uint64(44100)
-	err = pa.IsformatSupported(&in, nil, desiredSR)
-
-	if err != nil {
-		println("ERROR ", err.Error())
-		return
-	}
-
-	fmt.Println(in, " supports ", desiredSR)
-
-	si := &record{q: locklessq.NewQint16(int32(desiredSR * (*sec)))}
-
-	pa.CbStream = si
-
-	//Open stream
-	s, err := pa.OpenStream(&in, nil, in.Sampleformat, desiredSR, 1024)
-	if err != nil {
-		println("ERROR ", err.Error())
-		return
-	}
-
-	s.Start()
-	println("recording...")
-	time.Sleep(time.Duration(*sec) * time.Second)
-	s.Stop()
-	s.Close()
-
-	//play
-	if *action == "play" {
 		pa.ListDevices()
-		reader = bufio.NewReader(os.Stdin)
+
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print("Select device num for record: ")
+		text, _ := reader.ReadString('\n')
+		devnum, err := strconv.Atoi(strings.TrimSuffix(text, "\n"))
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		println("selected  ", devnum, " sample format ", sf)
+
+		in = pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: channels, Sampleformat: sf}
+		desiredSR = 44100
+		err = pa.IsformatSupported(&in, nil, desiredSR)
+
+		if err != nil {
+			println("ERROR ", err.Error())
+			return
+		}
+
+		fmt.Println(in, " supports ", desiredSR)
+
+		si = &record{q: locklessq.NewQint16(int32(desiredSR * (*sec)))}
+
+		pa.CbStream = si
+
+		//Open stream
+		s, err := pa.OpenStream(&in, nil, in.Sampleformat, desiredSR, 1024)
+		if err != nil {
+			println("ERROR ", err.Error())
+			return
+		}
+
+		s.Start()
+		println("recording...")
+		time.Sleep(time.Duration(*sec) * time.Second)
+		s.Stop()
+		s.Close()
+
+	} else if *action == "play" {
+		err := pa.Initialize()
+		if err != nil {
+			println("ERROR ", err.Error())
+			return
+		}
+		defer pa.Terminate()
+
+		wr, err := wavreader.New(*file)
+		if err != nil {
+			log.Fatal(err)
+		}
+		wr.String()
+		defer wr.Close()
+		player = &play{Wav: wr}
+
+		bps := player.BitsPerSample()
+
+		bytesPerSample := uint32(bps / 8)
+
+		buffsize := int32(wr.DataBytesCount() / bytesPerSample)
+
+		println("Allocating ", buffsize, " elems")
+
+		if bps == 16 {
+			player.q16 = locklessq.NewQint16(buffsize)
+			sf = pa.Int16
+			io.Copy(player, player)
+		} else if bps == 32 {
+			player.q32 = locklessq.NewQfloat32(buffsize)
+			sf = pa.Float32
+			io.Copy(player, player)
+		} else {
+			log.Fatal("Unsupported bps ", bps)
+		}
+
+		pa.ListDevices()
+		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("Select device num for play: ")
-		text, _ = reader.ReadString('\n')
-		devnum, err = strconv.Atoi(strings.TrimSuffix(text, "\n"))
+		text, _ := reader.ReadString('\n')
+
+		devnum, err := strconv.Atoi(strings.TrimSuffix(text, "\n"))
 		if err != nil {
 			println(err)
 			return
 		}
 
-		println("selected  ", devnum)
-		out := pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: 1, Sampleformat: pa.Int16}
+		println("selected  ", devnum, " sample format ", sf)
+		out := pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: int(player.NumChannels()), Sampleformat: sf}
 
-		sp := &play{q: si.q}
-
-		pa.CbStream = sp
-		s, err = pa.OpenStream(nil, &out, in.Sampleformat, desiredSR, 1024)
+		pa.CbStream = player
+		s, err := pa.OpenStream(nil, &out, in.Sampleformat, uint64(player.SampleRate()), 1024)
 		if err != nil {
 			println("ERROR ", err.Error())
 			return
@@ -126,7 +212,41 @@ func main() {
 		s.Stop()
 		s.Close()
 
-	} else if *action == "save" {
+		return
+
+	}
+
+	//play recording
+	if strings.Contains(*action, "play") {
+		pa.ListDevices()
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Print("Select device num for play: ")
+		text, _ := reader.ReadString('\n')
+		devnum, err := strconv.Atoi(strings.TrimSuffix(text, "\n"))
+		if err != nil {
+			println(err)
+			return
+		}
+
+		println("selected  ", devnum)
+		out := pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: channels, Sampleformat: sf}
+
+		player = &play{q16: si.q}
+
+		pa.CbStream = player
+		s, err := pa.OpenStream(nil, &out, in.Sampleformat, desiredSR, 1024)
+		if err != nil {
+			println("ERROR ", err.Error())
+			return
+		}
+
+		s.Start()
+		println("playing...")
+		time.Sleep(4 * time.Second)
+		s.Stop()
+		s.Close()
+
+	} else if *action == "recnsave" {
 		var wh wavreader.WavHHeader
 		var buff [44]byte
 		//CHunkID
