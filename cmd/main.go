@@ -33,6 +33,7 @@ type play struct {
 	*wavreader.Wav
 	q16 *locklessq.Qint16
 	q32 *locklessq.Qfloat32
+	nch uint16
 }
 
 func (p *play) Write(buff []byte) (int, error) {
@@ -65,16 +66,16 @@ func (p *play) CallBack(inputBuffer, outputBuffer unsafe.Pointer, frames uint64)
 }
 
 func (p *play) cb16(inputBuffer, outputBuffer unsafe.Pointer, frames uint64) {
-	ob := (*[1024]int16)(outputBuffer)
-	for i := 0; i < len(ob); i++ {
+	ob := (*[2048]int16)(outputBuffer)
+	for i := uint64(0); i < frames*uint64(p.nch); i++ {
 		val, _ := p.q16.Pop()
 		(*ob)[i] = val
 	}
 }
 
 func (p *play) cb32(inputBuffer, outputBuffer unsafe.Pointer, frames uint64) {
-	ob := (*[1024]float32)(outputBuffer)
-	for i := 0; i < len(ob); i++ {
+	ob := (*[2048]float32)(outputBuffer)
+	for i := uint64(0); i < frames*uint64(p.nch); i++ {
 		val, _ := p.q32.Pop()
 		(*ob)[i] = val
 	}
@@ -186,7 +187,7 @@ func main() {
 		}
 		wr.String()
 		defer wr.Close()
-		player = &play{Wav: wr}
+		player = &play{Wav: wr, nch: wr.NumChannels()}
 
 		bps := player.BitsPerSample()
 
@@ -219,7 +220,7 @@ func main() {
 
 		sec := (uint32(buffsize/int32(wr.NumChannels())) / wr.SampleRate()) + 1
 
-		println("selected  ", devnum, " sample format ", sf, " duration ", sec)
+		println("selected  ", devnum, " sample format ", sf, " duration ", sec, " num channels ", player.NumChannels())
 		playBuf(out, player, sf, uint64(wr.SampleRate()), int(sec))
 
 		return
@@ -238,7 +239,7 @@ func main() {
 		println("selected  ", devnum)
 		out := pa.PaStreamParameters{DeviceNum: devnum, ChannelCount: channels, Sampleformat: sf}
 
-		player = &play{q16: si.q}
+		player = &play{q16: si.q, nch: uint16(channels)}
 
 		playBuf(out, player, sf, desiredSR, int(*sec))
 
