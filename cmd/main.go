@@ -109,6 +109,37 @@ func playBuf(psp pa.PaStreamParameters, player *play, sf pa.SampleFormat, desire
 	s.Close()
 }
 
+func loadWave(file string, player *play, sf *pa.SampleFormat) (*wavreader.Wav, int32, *play) {
+	wr, err := wavreader.New(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+	wr.String()
+	defer wr.Close()
+	player = &play{Wav: wr, nch: wr.NumChannels()}
+
+	bps := player.BitsPerSample()
+
+	bytesPerSample := uint32(bps / 8)
+
+	buffsize := int32(wr.DataBytesCount() / bytesPerSample)
+
+	println("Allocating ", buffsize, " elems")
+
+	if bps == 16 {
+		player.q16 = locklessq.NewQint16(buffsize)
+		*sf = pa.Int16
+		io.Copy(player, player)
+	} else if bps == 32 {
+		player.q32 = locklessq.NewQfloat32(buffsize)
+		*sf = pa.Float32
+		io.Copy(player, player)
+	} else {
+		log.Fatal("Unsupported bps ", bps)
+	}
+
+	return wr, buffsize, player
+}
 func main() {
 
 	action := flag.String("action", "recnplay", "recnplay - records and plays\nrecnsave - records and saves the buffer as wav\nplay - plays a file")
@@ -181,34 +212,10 @@ func main() {
 		}
 		defer pa.Terminate()
 
-		wr, err := wavreader.New(*file)
-		if err != nil {
-			log.Fatal(err)
+		wr, buffsize, player := loadWave(*file, player, &sf)
+		if player == nil {
+			log.Fatal("Player is nil")
 		}
-		wr.String()
-		defer wr.Close()
-		player = &play{Wav: wr, nch: wr.NumChannels()}
-
-		bps := player.BitsPerSample()
-
-		bytesPerSample := uint32(bps / 8)
-
-		buffsize := int32(wr.DataBytesCount() / bytesPerSample)
-
-		println("Allocating ", buffsize, " elems")
-
-		if bps == 16 {
-			player.q16 = locklessq.NewQint16(buffsize)
-			sf = pa.Int16
-			io.Copy(player, player)
-		} else if bps == 32 {
-			player.q32 = locklessq.NewQfloat32(buffsize)
-			sf = pa.Float32
-			io.Copy(player, player)
-		} else {
-			log.Fatal("Unsupported bps ", bps)
-		}
-
 		devnum, err := selectDevice("Select device num for play: ")
 
 		if err != nil {
